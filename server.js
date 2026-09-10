@@ -1,150 +1,37 @@
+
+import 'dotenv/config';
 import express from 'express';
-import dotenv from 'dotenv';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 
-dotenv.config();
-const app = express();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.PORT || 3000);
-
-const required = ['SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY','PAYSTACK_SECRET_KEY'];
-const missing = required.filter(k => !process.env[k] || process.env[k].includes('PUT_'));
-if (missing.length) console.warn('Missing server environment variables:', missing.join(', '));
-
-const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
-  : null;
-
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+const __filename=fileURLToPath(import.meta.url), __dirname=path.dirname(__filename);
+const app=express();
+app.use(express.json({limit:'1mb'}));
+const PORT=process.env.PORT||10000;
+const SUPABASE_URL=process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY=process.env.SUPABASE_SERVICE_ROLE_KEY;
+const PAYSTACK_SECRET_KEY=process.env.PAYSTACK_SECRET_KEY;
+const SITE_URL=process.env.SITE_URL || process.env.RENDER_EXTERNAL_URL || 'http://localhost:10000';
+if(!SUPABASE_URL||!SUPABASE_SERVICE_ROLE_KEY) console.warn('Missing Supabase server environment variables');
+const supabase=SUPABASE_URL&&SUPABASE_SERVICE_ROLE_KEY?createClient(SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,{auth:{persistSession:false}}):null;
+const wa='2349041130288';
+const cleanPhone=v=>String(v||'').replace(/\D/g,'');
+const orderNo=()=>`BB-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+const bad=(res,msg,status=400)=>res.status(status).json({error:msg});
+app.get('/api/health',(req,res)=>res.json({ok:true,service:'bestbite-enterprise'}));
+app.get('/api/products',async(req,res)=>{if(!supabase)return bad(res,'Database is not configured',503);let {data,error}=await supabase.from('products').select('*').eq('is_available',true).order('created_at',{ascending:true});if(error)return bad(res,error.message,500);res.json({products:data||[]})});
+app.post('/api/orders',async(req,res)=>{try{if(!supabase)return bad(res,'Database is not configured',503);let {customer_name,customer_email,customer_phone,delivery_address,notes,items,payment_method='whatsapp',delivery_fee:requestedDeliveryFee}=req.body||{};customer_name=String(customer_name||'').trim();customer_phone=cleanPhone(customer_phone);customer_email=String(customer_email||'').trim()||null;delivery_address=String(delivery_address||'').trim();notes=String(notes||'').trim()||null;if(!customer_name||customer_phone.length<7||!delivery_address)return bad(res,'Name, phone and delivery address are required');if(!Array.isArray(items)||!items.length)return bad(res,'Cart is empty');if(!['whatsapp','cash_on_delivery','bank_transfer','paystack'].includes(payment_method))payment_method='whatsapp';let names=[...new Set(items.map(x=>String(x.name||'').trim()).filter(Boolean))];let {data:prods,error:pe}=await supabase.from('products').select('id,name,price,is_available').in('name',names);if(pe)return bad(res,pe.message,500);let byName=new Map((prods||[]).map(p=>[p.name,p]));let cleanItems=[];for(const raw of items){let p=byName.get(String(raw.name||'').trim());let qty=Math.max(1,Math.min(50,Number.parseInt(raw.qty,10)||0));if(!p||!p.is_available||qty<1)return bad(res,'One or more cart items are unavailable');cleanItems.push({product_id:p.id,product_name:p.name,quantity:qty,unit_price:Number(p.price)});}let subtotal=cleanItems.reduce((s,x)=>s+x.quantity*x.unit_price,0);
+let delivery_fee=Number(requestedDeliveryFee);
+if(![1500,2000].includes(delivery_fee)) return bad(res,'Please select a valid delivery fee: ₦1,500 or ₦2,000');
+if(!subtotal) delivery_fee=0;
+let total_amount=subtotal+delivery_fee;let {data:c,error:ce}=await supabase.from('customers').insert({name:customer_name,email:customer_email,phone:customer_phone,address:delivery_address}).select('id').single();if(ce)return bad(res,ce.message,500);let order_number=orderNo();let {data:o,error:oe}=await supabase.from('orders').insert({order_number,customer_id:c.id,customer_name,customer_email,customer_phone,delivery_address,customer_notes:notes,subtotal,delivery_fee,total_amount,payment_method}).select('*').single();if(oe)return bad(res,oe.message,500);let {error:ie}=await supabase.from('order_items').insert(cleanItems.map(x=>({...x,order_id:o.id})));if(ie){await supabase.from('orders').delete().eq('id',o.id);return bad(res,ie.message,500)}let text=`Hello Bestbite Enterprise!%0AOrder: ${order_number}%0AName: ${encodeURIComponent(customer_name)}%0APhone: ${encodeURIComponent(customer_phone)}%0AAddress: ${encodeURIComponent(delivery_address)}%0A%0A${cleanItems.map(x=>`${encodeURIComponent(x.product_name)} x ${x.quantity} = ₦${x.quantity*x.unit_price}`).join('%0A')}%0A%0ASubtotal: ₦${subtotal}%0ADelivery: ₦${delivery_fee}%0ATotal: ₦${total_amount}%0APayment: ${payment_method}`;res.json({order:o,whatsapp_url:`https://wa.me/${wa}?text=${text}`})}catch(e){console.error(e);bad(res,'Could not create order',500)}});
+app.get('/api/orders/lookup',async(req,res)=>{if(!supabase)return bad(res,'Database is not configured',503);let number=String(req.query.order_number||'').trim(),phone=cleanPhone(req.query.phone);if(!number||phone.length<7)return bad(res,'Order number and phone are required');let {data,error}=await supabase.from('orders').select('*,order_items(*)').eq('order_number',number).eq('customer_phone',phone).single();if(error||!data)return bad(res,'Order not found',404);res.json({order:data})});
+async function paystackRequest(endpoint,options={}){let r=await fetch(`https://api.paystack.co${endpoint}`,{...options,headers:{Authorization:`Bearer ${PAYSTACK_SECRET_KEY}`,'Content-Type':'application/json',...(options.headers||{})}});let j=await r.json();if(!r.ok||j.status===false)throw new Error(j.message||'Paystack request failed');return j;}
+app.post('/api/paystack/initialize',async(req,res)=>{try{if(!PAYSTACK_SECRET_KEY)return bad(res,'Paystack is not configured',503);let orderNumber=String(req.body?.order_number||'').trim();let {data:o,error}=await supabase.from('orders').select('*').eq('order_number',orderNumber).single();if(error||!o)return bad(res,'Order not found',404);if(!o.customer_email)return bad(res,'Customer email is required for Paystack');let j=await paystackRequest('/transaction/initialize',{method:'POST',body:JSON.stringify({email:o.customer_email,amount:o.total_amount*100,currency:'NGN',reference:`${o.order_number}-${crypto.randomBytes(4).toString('hex')}`,callback_url:`${SITE_URL}/payment-complete.html`})});let ref=j.data.reference;await supabase.from('orders').update({paystack_reference:ref}).eq('id',o.id);await supabase.from('payments').insert({order_id:o.id,provider:'paystack',reference:ref,amount:o.total_amount,currency:'NGN',status:'pending'});res.json({authorization_url:j.data.authorization_url,reference:ref})}catch(e){console.error(e);bad(res,e.message||'Payment initialization failed',500)}});
+app.get('/api/paystack/verify/:reference',async(req,res)=>{try{if(!PAYSTACK_SECRET_KEY)return bad(res,'Paystack is not configured',503);let ref=String(req.params.reference);let j=await paystackRequest(`/transaction/verify/${encodeURIComponent(ref)}`);let d=j.data;let {data:o,error}=await supabase.from('orders').select('*').eq('paystack_reference',ref).single();if(error||!o)return bad(res,'Order for this payment was not found',404);let expected=o.total_amount*100;if(Number(d.amount)!==expected||d.currency!=='NGN')return bad(res,'Payment amount or currency mismatch',400);let success=d.status==='success';await supabase.from('payments').update({status:success?'success':'failed',gateway_response:d.gateway_response||null,paid_at:success?(d.paid_at||new Date().toISOString()):null,raw_response:d,updated_at:new Date().toISOString()}).eq('reference',ref);await supabase.from('orders').update({payment_status:success?'paid':'failed',updated_at:new Date().toISOString()}).eq('id',o.id);res.json({ok:success,order:{...o,payment_status:success?'paid':'failed'}})}catch(e){console.error(e);bad(res,e.message||'Verification failed',500)}});
+app.post('/api/paystack/webhook',async(req,res)=>{try{let signature=req.headers['x-paystack-signature'];let expected=crypto.createHmac('sha512',PAYSTACK_SECRET_KEY||'').update(JSON.stringify(req.body)).digest('hex');if(!signature||signature!==expected)return res.sendStatus(401);res.sendStatus(200);if(req.body?.event==='charge.success'&&req.body?.data?.reference){try{let ref=req.body.data.reference;let j=await paystackRequest(`/transaction/verify/${encodeURIComponent(ref)}`);let d=j.data;let {data:o}=await supabase.from('orders').select('*').eq('paystack_reference',ref).single();if(o&&d.status==='success'&&Number(d.amount)===o.total_amount*100&&d.currency==='NGN'){await supabase.from('payments').update({status:'success',gateway_response:d.gateway_response||null,paid_at:d.paid_at||new Date().toISOString(),raw_response:d,updated_at:new Date().toISOString()}).eq('reference',ref);await supabase.from('orders').update({payment_status:'paid',updated_at:new Date().toISOString()}).eq('id',o.id)}}catch(err){console.error('Webhook processing error',err)}}}catch(e){console.error(e);return res.sendStatus(500)}});
 app.use(express.static(__dirname));
-
-const clean = v => typeof v === 'string' ? v.trim() : '';
-const makeOrderNumber = () => {
-  const d = new Date();
-  const date = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-  return `BB-${date}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
-};
-const whatsappUrl = order => {
-  const lines = [
-    '*Bestbite Enterprise Order*', `Order: ${order.order_number}`, '',
-    ...(order.order_items || []).map(i => `${i.product_name} x ${i.quantity} — ₦${Number(i.unit_price).toLocaleString()}`),
-    '', `Subtotal: ₦${Number(order.subtotal).toLocaleString()}`,
-    `Delivery: ₦${Number(order.delivery_fee).toLocaleString()}`,
-    `Total: ₦${Number(order.total_amount).toLocaleString()}`,
-    `Customer: ${order.customer_name}`, `Phone: ${order.customer_phone}`,
-    `Address: ${order.delivery_address}`,
-    order.customer_notes ? `Notes: ${order.customer_notes}` : ''
-  ].filter(Boolean);
-  return `https://wa.me/2349041130288?text=${encodeURIComponent(lines.join('\n'))}`;
-};
-
-app.get('/api/health', (req,res) => res.json({ok:true, service:'Bestbite Enterprise'}));
-
-app.get('/api/products', async (req,res) => {
-  if (!supabase) return res.status(500).json({error:'Server is not configured'});
-  const { data, error } = await supabase.from('products').select('*').eq('is_available', true).order('created_at');
-  if (error) return res.status(500).json({error:error.message});
-  res.json({products:data});
-});
-
-app.post('/api/orders', async (req,res) => {
-  try {
-    if (!supabase) return res.status(500).json({error:'Server is not configured'});
-    const body = req.body || {};
-    const customer_name = clean(body.customer_name);
-    const customer_email = clean(body.customer_email);
-    const customer_phone = clean(body.customer_phone);
-    const delivery_address = clean(body.delivery_address);
-    const customer_notes = clean(body.notes);
-    const payment_method = ['whatsapp','cash_on_delivery','bank_transfer','paystack'].includes(body.payment_method) ? body.payment_method : 'whatsapp';
-    if (!customer_name || !customer_phone || !delivery_address) return res.status(400).json({error:'Name, phone and delivery address are required'});
-    if (payment_method === 'paystack' && !customer_email) return res.status(400).json({error:'Email is required for Paystack'});
-    if (!Array.isArray(body.items) || !body.items.length) return res.status(400).json({error:'Cart is empty'});
-
-    const names = [...new Set(body.items.map(i => clean(i.name)).filter(Boolean))];
-    if (!names.length || names.length !== body.items.length) return res.status(400).json({error:'Invalid cart items'});
-    const {data: products, error: pe} = await supabase.from('products').select('id,name,price,is_available').in('name', names).eq('is_available', true);
-    if (pe) throw pe;
-    const byName = new Map((products || []).map(p => [p.name, p]));
-    const normalized = [];
-    for (const item of body.items) {
-      const p = byName.get(clean(item.name));
-      const qty = Number(item.qty);
-      if (!p || !Number.isInteger(qty) || qty < 1 || qty > 50) return res.status(400).json({error:`Invalid product or quantity: ${item.name}`});
-      normalized.push({product_id:p.id, product_name:p.name, quantity:qty, unit_price:Number(p.price)});
-    }
-    const subtotal = normalized.reduce((s,i)=>s+i.quantity*i.unit_price,0);
-    const delivery_fee = subtotal ? 600 : 0;
-    const total_amount = subtotal + delivery_fee;
-
-    let customer_id = null;
-    const {data: customer} = await supabase.from('customers').insert({name:customer_name,email:customer_email||null,phone:customer_phone,address:delivery_address}).select('id').single();
-    if (customer) customer_id = customer.id;
-
-    const order_number = makeOrderNumber();
-    const {data: order, error: oe} = await supabase.from('orders').insert({order_number,customer_id,customer_name,customer_email:customer_email||null,customer_phone,delivery_address,customer_notes,subtotal,delivery_fee,total_amount,payment_method,payment_status:'pending',order_status:'new'}).select('*').single();
-    if (oe) throw oe;
-    const {error: ie} = await supabase.from('order_items').insert(normalized.map(i=>({...i,order_id:order.id})));
-    if (ie) throw ie;
-    const {data: full, error: fe} = await supabase.from('orders').select('*,order_items(*)').eq('id',order.id).single();
-    if (fe) throw fe;
-    res.json({order:full, whatsapp_url:whatsappUrl(full)});
-  } catch (e) { console.error(e); res.status(500).json({error:e.message || 'Could not create order'}); }
-});
-
-app.post('/api/paystack/initialize', async (req,res) => {
-  try {
-    if (!supabase || !process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET_KEY.includes('PUT_')) return res.status(500).json({error:'Paystack server secret is not configured'});
-    const order_number = clean(req.body?.order_number);
-    const {data: order, error} = await supabase.from('orders').select('*').eq('order_number',order_number).single();
-    if (error || !order) return res.status(404).json({error:'Order not found'});
-    if (order.payment_method !== 'paystack') return res.status(400).json({error:'Order is not a Paystack order'});
-    const callback_url = `${process.env.SITE_URL || 'http://localhost:'+PORT}/payment-complete.html`;
-    const response = await fetch('https://api.paystack.co/transaction/initialize', {
-      method:'POST', headers:{Authorization:`Bearer ${process.env.PAYSTACK_SECRET_KEY}`,'Content-Type':'application/json'},
-      body:JSON.stringify({email:order.customer_email,amount:Number(order.total_amount)*100,currency:'NGN',reference:order.order_number,callback_url,metadata:{order_id:order.id,order_number:order.order_number}})
-    });
-    const data = await response.json();
-    if (!response.ok || !data.status) return res.status(502).json({error:data.message || 'Paystack initialization failed'});
-    await supabase.from('orders').update({paystack_reference:data.data.reference}).eq('id',order.id);
-    await supabase.from('payments').upsert({order_id:order.id,provider:'paystack',reference:data.data.reference,amount:Number(order.total_amount)*100,currency:'NGN',status:'pending'}, {onConflict:'reference'});
-    res.json({authorization_url:data.data.authorization_url,reference:data.data.reference});
-  } catch(e){console.error(e);res.status(500).json({error:e.message||'Payment initialization failed'});}
-});
-
-async function verifyPaystack(reference){
-  const response = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,{headers:{Authorization:`Bearer ${process.env.PAYSTACK_SECRET_KEY}`}});
-  const data = await response.json();
-  if (!response.ok || !data.status) throw new Error(data.message || 'Paystack verification failed');
-  const tx = data.data;
-  const {data: order, error: oe} = await supabase.from('orders').select('*').eq('order_number',reference).single();
-  if (oe || !order) throw new Error('Order for payment reference not found');
-  const expected = Number(order.total_amount)*100;
-  if (Number(tx.amount) !== expected || tx.currency !== 'NGN') throw new Error('Payment amount/currency does not match the order');
-  const paid = tx.status === 'success';
-  await supabase.from('payments').upsert({order_id:order.id,provider:'paystack',reference:tx.reference,amount:Number(tx.amount),currency:tx.currency,status:paid?'success':(tx.status||'failed'),gateway_response:tx.gateway_response||null,paid_at:paid?(tx.paid_at||new Date().toISOString()):null,raw_response:tx},{onConflict:'reference'});
-  await supabase.from('orders').update({payment_status:paid?'paid':'failed',paystack_reference:tx.reference}).eq('id',order.id);
-  return {paid,order_number:order.order_number,transaction:tx};
-}
-
-app.get('/api/paystack/verify/:reference', async (req,res)=>{
-  try { if(!process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET_KEY.includes('PUT_')) return res.status(500).json({error:'Paystack server secret is not configured'}); res.json(await verifyPaystack(clean(req.params.reference))); }
-  catch(e){console.error(e);res.status(400).json({error:e.message||'Verification failed'});}
-});
-
-app.post('/api/paystack/webhook', async (req,res)=>{
-  try {
-    if(!process.env.PAYSTACK_SECRET_KEY) return res.sendStatus(500);
-    const signature = req.headers['x-paystack-signature'];
-    const hash = crypto.createHmac('sha512',process.env.PAYSTACK_SECRET_KEY).update(req.rawBody || Buffer.from(JSON.stringify(req.body))).digest('hex');
-    if(!signature || !crypto.timingSafeEqual(Buffer.from(signature),Buffer.from(hash))) return res.sendStatus(401);
-    if(req.body?.event === 'charge.success' && req.body?.data?.reference) await verifyPaystack(req.body.data.reference);
-    res.sendStatus(200);
-  } catch(e){console.error(e);res.sendStatus(200);}
-});
-
-app.get(/.*/, (req,res) => res.sendFile(path.join(__dirname,'index.html')));
-app.listen(PORT, '0.0.0.0', ()=>console.log(`Bestbite running on port ${PORT}`));
+app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'index.html')));
+app.listen(PORT,'0.0.0.0',()=>console.log(`Bestbite running on port ${PORT}`));
